@@ -1,8 +1,8 @@
 #!/bin/bash
 
-python /benchmarks/benchmark_serving.py \
+python benchmarks/benchmark_serving.py \
     --backend "openai-chat" \
-    --model  "/media/akk/hdd3/hf_model/Qwen/Qwen2-VL-7B-Instruct"\
+    --model  <your model path> \
     --dataset-name sharegpt \
-    --dataset-path "/home/akk/brada/mmvet_v2.json" \
+    --dataset-path  <your dataset path>  \
     --num-prompts 1 
