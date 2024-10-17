@@ -34,12 +34,12 @@ import warnings
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, AsyncGenerator, Collection, Dict, List, Optional, Tuple
-
+import itertools
 import numpy as np
 from backend_request_func import (ASYNC_REQUEST_FUNCS, RequestFuncInput,
                                   RequestFuncOutput)
 from datasets import load_dataset
-from PIL.Image import Image
+from PIL import Image
 from tqdm.asyncio import tqdm
 from transformers import PreTrainedTokenizerBase
 
@@ -52,12 +52,15 @@ try:
     from vllm.utils import FlexibleArgumentParser
 except ImportError:
     from argparse import ArgumentParser as FlexibleArgumentParser
+from transformers import AutoProcessor, AutoModel
+import torch
 
+from io import BytesIO
 
 @dataclass
 class BenchmarkMetrics:
     completed: int
-    total_input: int
+    total_text_input: int
     total_output: int
     request_throughput: float
     output_throughput: float
@@ -82,7 +85,6 @@ class BenchmarkMetrics:
     std_e2el_ms: float
     percentiles_e2el_ms: List[Tuple[float, float]]
 
-
 def sample_sharegpt_requests(
     dataset_path: str,
     num_requests: int,
@@ -90,27 +92,36 @@ def sample_sharegpt_requests(
     fixed_output_len: Optional[int] = None,
 ) -> List[Tuple[str, int, int, None]]:
     # Load the dataset.
+
     with open(dataset_path, encoding='utf-8') as f:
         dataset = json.load(f)
+    print(f"Dataset len : {len(dataset)}")
+
     # Filter out the conversations with less than 2 turns.
     dataset = [data for data in dataset if len(data["conversations"]) >= 2]
     # Only keep the first two turns of each conversation.
-    dataset = [(data["conversations"][0]["value"],
-                data["conversations"][1]["value"]) for data in dataset]
+    dataset = [
+        (
+            data["conversations"][0]["value"],
+            data["conversations"][1]["value"],
+            data["mm_content"]
+        )
+        for data in dataset
+    ]
 
     # Shuffle the dataset.
     random.shuffle(dataset)
 
     # Filter out sequences that are too long or too short
     filtered_dataset: List[Tuple[str, int, int]] = []
-    for i in range(len(dataset)):
+    for data in itertools.cycle(dataset):
         if len(filtered_dataset) == num_requests:
             break
 
         # Tokenize the prompts and completions.
-        prompt = dataset[i][0]
+        prompt = data[0]
         prompt_token_ids = tokenizer(prompt).input_ids
-        completion = dataset[i][1]
+        completion = data[1]
         completion_token_ids = tokenizer(completion).input_ids
         prompt_len = len(prompt_token_ids)
         output_len = len(completion_token_ids
@@ -119,9 +130,11 @@ def sample_sharegpt_requests(
             # Prune too short sequences.
             continue
         if prompt_len > 1024 or prompt_len + output_len > 2048:
+ 
             # Prune too long sequences.
             continue
-        filtered_dataset.append((prompt, prompt_len, output_len, None))
+        mm_content = data[2]
+        filtered_dataset.append((prompt, prompt_len, output_len, mm_content))
 
     return filtered_dataset
 
@@ -196,6 +209,7 @@ def sample_sonnet_requests(
     return sampled_requests
 
 
+    
 def sample_hf_requests(
     dataset_path: str,
     dataset_subset: str,
@@ -234,8 +248,8 @@ def sample_hf_requests(
             # Prune too long sequences.
             continue
 
-        if "image" in data and isinstance(data["image"], Image):
-            image: Image = data["image"]
+        if "image" in data and isinstance(data["image"], Image.Image):
+            image: Image.Image = data["image"]
             image = image.convert("RGB")
             image_data = io.BytesIO()
             image.save(image_data, format='JPEG')
@@ -309,6 +323,7 @@ async def get_request(
 
 
 def calculate_metrics(
+    model_id:str,
     input_requests: List[Tuple[str, int, int]],
     outputs: List[RequestFuncOutput],
     dur_s: float,
@@ -317,7 +332,7 @@ def calculate_metrics(
     selected_percentiles: List[float],
 ) -> Tuple[BenchmarkMetrics, List[int]]:
     actual_output_lens: List[int] = []
-    total_input = 0
+    total_text_input = 0
     completed = 0
     itls: List[float] = []
     tpots: List[float] = []
@@ -333,7 +348,7 @@ def calculate_metrics(
                 tokenizer(outputs[i].generated_text,
                           add_special_tokens=False).input_ids)
             actual_output_lens.append(output_len)
-            total_input += input_requests[i][1]
+            total_text_input += input_requests[i][1]
             if output_len > 1:
                 tpots.append(
                     (outputs[i].latency - outputs[i].ttft) / (output_len - 1))
@@ -351,11 +366,11 @@ def calculate_metrics(
             stacklevel=2)
     metrics = BenchmarkMetrics(
         completed=completed,
-        total_input=total_input,
+        total_text_input=total_text_input,
         total_output=sum(actual_output_lens),
         request_throughput=completed / dur_s,
         output_throughput=sum(actual_output_lens) / dur_s,
-        total_token_throughput=(total_input + sum(actual_output_lens)) / dur_s,
+        total_token_throughput=(total_text_input + sum(actual_output_lens)) / dur_s,
         mean_ttft_ms=np.mean(ttfts or 0) *
         1000,  # ttfts is empty if streaming is not supported by backend
         std_ttft_ms=np.std(ttfts or 0) * 1000,
@@ -398,6 +413,7 @@ async def benchmark(
     selected_percentiles: List[str],
     ignore_eos: bool,
 ):
+
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
     else:
@@ -490,6 +506,7 @@ async def benchmark(
     benchmark_duration = time.perf_counter() - benchmark_start_time
 
     metrics, actual_output_lens = calculate_metrics(
+        model_id = model_id,
         input_requests=input_requests,
         outputs=outputs,
         dur_s=benchmark_duration,
@@ -502,7 +519,8 @@ async def benchmark(
     print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
     print("{:<40} {:<10.2f}".format("Benchmark duration (s):",
                                     benchmark_duration))
-    print("{:<40} {:<10}".format("Total input tokens:", metrics.total_input))
+    print("{:<40} {:<10}".format("Total input tokens:", metrics.total_text_input))
+
     print("{:<40} {:<10}".format("Total generated tokens:",
                                  metrics.total_output))
     print("{:<40} {:<10.2f}".format("Request throughput (req/s):",
@@ -515,7 +533,7 @@ async def benchmark(
     result = {
         "duration": benchmark_duration,
         "completed": metrics.completed,
-        "total_input_tokens": metrics.total_input,
+        "total_input_tokens": metrics.total_text_input,
         "total_output_tokens": metrics.total_output,
         "request_throughput": metrics.request_throughput,
         "output_throughput": metrics.output_throughput,
@@ -746,7 +764,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--endpoint",
         type=str,
-        default="/v1/completions",
+        default="/v1/chat/completions",
         help="API endpoint.",
     )
     parser.add_argument(
